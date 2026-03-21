@@ -1,9 +1,25 @@
+# data
+Norman et al., 2019 (Science) labeled Perturb-seq data
+https://figshare.com/articles/dataset/Norman_et_al_2019_Science_labeled_Perturb-seq_data/24688110?file=43390776
+
 # gene embeding(geneformer)
  python train_geneformer_from_raw_and_export_hvg.py
 
  python3 pad_geneformer_hvg_embeddings.py recover to 2000 dim(p.nan)
 
 
+# cell embeding(scFoundation)
+
+python get_embedding.py \
+  --task_name norman_2019 \
+  --input_type singlecell \
+  --output_type cell \
+  --pool_type all \
+  --tgthighres t4 \
+  --data_path norman_2019_adata.h5ad \
+  --save_path reinforce \
+  --pre_normalized T \
+  --version ce
 
 # transformer predictor
 python predict.py \
