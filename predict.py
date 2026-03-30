@@ -12,6 +12,85 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
 
+PERT_GENE_IDS_CACHE = None
+PERT_GENE_MASK_CACHE = None
+PERT_GENE_VOCAB_CACHE = None
+
+
+def _normalize_guide_value(value) -> str:
+    if value is None:
+        return "__missing__"
+    if isinstance(value, float) and math.isnan(value):
+        return "__missing__"
+    value_str = str(value)
+    if value_str.lower() == "nan":
+        return "__missing__"
+    return value_str
+
+
+def _parse_guide_merged(value) -> list[str]:
+    value_str = _normalize_guide_value(value)
+    if value_str in {"__missing__", "", "ctrl"}:
+        return []
+
+    genes = []
+    for token in value_str.split("+"):
+        gene = token.strip()
+        if not gene or gene.lower() == "ctrl":
+            continue
+        genes.append(gene)
+
+    # Preserve order while dropping duplicates inside one perturbation.
+    return list(dict.fromkeys(genes))
+
+
+def _encode_guide_merged(adata) -> tuple[np.ndarray, np.ndarray]:
+    global PERT_GENE_IDS_CACHE, PERT_GENE_MASK_CACHE, PERT_GENE_VOCAB_CACHE
+
+    if "guide_merged" not in adata.obs.columns:
+        PERT_GENE_IDS_CACHE = np.zeros((adata.n_obs, 1), dtype=np.int64)
+        PERT_GENE_MASK_CACHE = np.zeros((adata.n_obs, 1), dtype=np.float32)
+        PERT_GENE_VOCAB_CACHE = np.array([], dtype=object)
+        return PERT_GENE_IDS_CACHE, PERT_GENE_MASK_CACHE
+
+    parsed_guides = [_parse_guide_merged(value) for value in adata.obs["guide_merged"].tolist()]
+    perturbed_genes = sorted({gene for gene_list in parsed_guides for gene in gene_list})
+    gene2idx = {gene: idx for idx, gene in enumerate(perturbed_genes)}
+
+    max_genes_per_cell = max((len(gene_list) for gene_list in parsed_guides), default=0)
+    padded_width = max(1, max_genes_per_cell)
+    pert_gene_ids = np.zeros((adata.n_obs, padded_width), dtype=np.int64)
+    pert_gene_mask = np.zeros((adata.n_obs, padded_width), dtype=np.float32)
+
+    for row_idx, gene_list in enumerate(parsed_guides):
+        for col_idx, gene in enumerate(gene_list):
+            pert_gene_ids[row_idx, col_idx] = gene2idx[gene]
+            pert_gene_mask[row_idx, col_idx] = 1.0
+
+    PERT_GENE_IDS_CACHE = pert_gene_ids
+    PERT_GENE_MASK_CACHE = pert_gene_mask
+    PERT_GENE_VOCAB_CACHE = np.array(perturbed_genes, dtype=object)
+    return PERT_GENE_IDS_CACHE, PERT_GENE_MASK_CACHE
+
+
+def get_cached_pert_gene_ids(num_cells: int) -> np.ndarray:
+    if PERT_GENE_IDS_CACHE is None or len(PERT_GENE_IDS_CACHE) != num_cells:
+        return np.zeros((num_cells, 1), dtype=np.int64)
+    return PERT_GENE_IDS_CACHE
+
+
+def get_cached_pert_gene_mask(num_cells: int) -> np.ndarray:
+    if PERT_GENE_MASK_CACHE is None or len(PERT_GENE_MASK_CACHE) != num_cells:
+        return np.zeros((num_cells, 1), dtype=np.float32)
+    return PERT_GENE_MASK_CACHE
+
+
+def get_cached_num_guides() -> int:
+    if PERT_GENE_VOCAB_CACHE is None:
+        return 0
+    return int(len(PERT_GENE_VOCAB_CACHE))
+
+
 def load_expression_from_h5ad(h5ad_path: str) -> np.ndarray:
     """
     Load adata.X from h5ad as the target expression matrix.
@@ -22,6 +101,7 @@ def load_expression_from_h5ad(h5ad_path: str) -> np.ndarray:
         Shape [num_cells, num_genes]
     """
     adata = sc.read_h5ad(h5ad_path)
+    _encode_guide_merged(adata)
     X = adata.X
 
     if sp.issparse(X):
@@ -56,18 +136,35 @@ class ExpressionDataset(Dataset):
     cell_embeddings: [N, Dc]
     expression_matrix: [N, G]
     """
-    def __init__(self, cell_embeddings: np.ndarray, expression_matrix: np.ndarray):
+    def __init__(
+        self,
+        cell_embeddings: np.ndarray,
+        expression_matrix: np.ndarray,
+        pert_gene_ids: np.ndarray,
+        pert_gene_mask: np.ndarray,
+    ):
         assert cell_embeddings.shape[0] == expression_matrix.shape[0], \
             "cell_embeddings and expression_matrix must have the same number of cells."
+        assert cell_embeddings.shape[0] == pert_gene_ids.shape[0], \
+            "cell_embeddings and pert_gene_ids must have the same number of cells."
+        assert cell_embeddings.shape[0] == pert_gene_mask.shape[0], \
+            "cell_embeddings and pert_gene_mask must have the same number of cells."
 
         self.cell_embeddings = torch.tensor(cell_embeddings, dtype=torch.float32)
         self.expression_matrix = torch.tensor(expression_matrix, dtype=torch.float32)
+        self.pert_gene_ids = torch.tensor(pert_gene_ids, dtype=torch.long)
+        self.pert_gene_mask = torch.tensor(pert_gene_mask, dtype=torch.float32)
 
     def __len__(self):
         return self.cell_embeddings.shape[0]
 
     def __getitem__(self, idx):
-        return self.cell_embeddings[idx], self.expression_matrix[idx]
+        return (
+            self.cell_embeddings[idx],
+            self.expression_matrix[idx],
+            self.pert_gene_ids[idx],
+            self.pert_gene_mask[idx],
+        )
 
 
 class PositionalEncoding(nn.Module):
@@ -114,6 +211,7 @@ class GeneCellTransformerPredictor(nn.Module):
         self,
         gene_embeddings: np.ndarray,
         cell_dim: int,
+        num_guides: int,
         model_dim: int = 256,
         num_heads: int = 8,
         num_layers: int = 4,
@@ -130,6 +228,8 @@ class GeneCellTransformerPredictor(nn.Module):
 
         self.gene_proj = nn.Linear(gene_dim, model_dim)
         self.cell_proj = nn.Linear(cell_dim, model_dim)
+        self.pert_gene_emb = nn.Embedding(max(num_guides, 1), model_dim)
+        self.ctrl_embedding = nn.Parameter(torch.zeros(model_dim))
 
         self.pos_encoder = PositionalEncoding(model_dim, max_len=self.num_genes)
 
@@ -148,9 +248,16 @@ class GeneCellTransformerPredictor(nn.Module):
             nn.Linear(model_dim, 1)
         )
 
-    def forward(self, cell_embedding: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        cell_embedding: torch.Tensor,
+        pert_gene_ids: torch.Tensor,
+        pert_gene_mask: torch.Tensor,
+    ) -> torch.Tensor:
         """
         cell_embedding: [B, Dc]
+        pert_gene_ids: [B, P]
+        pert_gene_mask: [B, P]
         returns: [B, G]
         """
         batch_size = cell_embedding.shape[0]
@@ -161,9 +268,16 @@ class GeneCellTransformerPredictor(nn.Module):
 
         # [B, Dc] -> [B, D] -> [B, 1, D]
         cell_context = self.cell_proj(cell_embedding).unsqueeze(1)  # [B, 1, D]
+        pert_gene_embs = self.pert_gene_emb(pert_gene_ids)  # [B, P, D]
+        pert_gene_mask = pert_gene_mask.unsqueeze(-1)  # [B, P, 1]
+        pert_counts = pert_gene_mask.sum(dim=1)  # [B, 1]
+        pert_sum = (pert_gene_embs * pert_gene_mask).sum(dim=1)  # [B, D]
+        avg_pert = pert_sum / pert_counts.clamp_min(1.0)
+        ctrl_context = self.ctrl_embedding.unsqueeze(0).expand(batch_size, -1)
+        pert_context = torch.where(pert_counts > 0, avg_pert, ctrl_context).unsqueeze(1)
 
-        # Condition each gene token on the cell embedding
-        x = gene_tokens + cell_context  # [B, G, D]
+        # Condition each gene token on the cell embedding and perturbation guide.
+        x = gene_tokens + cell_context + pert_context  # [B, G, D]
         x = self.pos_encoder(x)
         x = self.transformer(x)
 
@@ -190,9 +304,13 @@ def build_dataloader(
     shuffle: bool,
     num_workers: int
 ) -> DataLoader:
+    pert_gene_ids = get_cached_pert_gene_ids(cell_embeddings.shape[0])
+    pert_gene_mask = get_cached_pert_gene_mask(cell_embeddings.shape[0])
     dataset = ExpressionDataset(
         cell_embeddings=cell_embeddings[indices],
-        expression_matrix=expression_matrix[indices]
+        expression_matrix=expression_matrix[indices],
+        pert_gene_ids=pert_gene_ids[indices],
+        pert_gene_mask=pert_gene_mask[indices],
     )
     return DataLoader(
         dataset,
@@ -208,12 +326,14 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     total_loss = 0.0
     total_samples = 0
 
-    for cell_emb, expr in loader:
+    for cell_emb, expr, pert_gene_ids, pert_gene_mask in loader:
         cell_emb = cell_emb.to(device)
         expr = expr.to(device)
+        pert_gene_ids = pert_gene_ids.to(device)
+        pert_gene_mask = pert_gene_mask.to(device)
 
         optimizer.zero_grad()
-        pred = model(cell_emb)
+        pred = model(cell_emb, pert_gene_ids, pert_gene_mask)
         loss = criterion(pred, expr)
         loss.backward()
         optimizer.step()
@@ -231,11 +351,13 @@ def evaluate(model, loader, criterion, device):
     total_loss = 0.0
     total_samples = 0
 
-    for cell_emb, expr in loader:
+    for cell_emb, expr, pert_gene_ids, pert_gene_mask in loader:
         cell_emb = cell_emb.to(device)
         expr = expr.to(device)
+        pert_gene_ids = pert_gene_ids.to(device)
+        pert_gene_mask = pert_gene_mask.to(device)
 
-        pred = model(cell_emb)
+        pred = model(cell_emb, pert_gene_ids, pert_gene_mask)
         loss = criterion(pred, expr)
 
         bs = cell_emb.size(0)
@@ -264,6 +386,7 @@ def fit_model(
     model = GeneCellTransformerPredictor(
         gene_embeddings=gene_embeddings,
         cell_dim=cell_embeddings.shape[1],
+        num_guides=get_cached_num_guides(),
         model_dim=model_dim,
         num_heads=num_heads,
         num_layers=num_layers,
@@ -360,6 +483,7 @@ def main():
     print("gene_embeddings shape:", gene_embeddings.shape)
     print("cell_embeddings shape:", cell_embeddings.shape)
     print("expression_matrix shape:", expression_matrix.shape)
+    print("num_guides:", get_cached_num_guides())
 
     assert expression_matrix.shape[0] == cell_embeddings.shape[0], (
         f"Number of cells mismatch: expression has {expression_matrix.shape[0]}, "
@@ -411,6 +535,7 @@ def main():
             "gene_embeddings_shape": gene_embeddings.shape,
             "cell_embeddings_shape": cell_embeddings.shape,
             "expression_shape": expression_matrix.shape,
+            "num_guides": get_cached_num_guides(),
             "args": vars(args),
         },
         args.save_path
