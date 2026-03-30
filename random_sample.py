@@ -15,7 +15,7 @@ from predict import (
     build_dataloader,
 )
 
-DEFAULT_OUTPUT_DIR = Path("/ocean/projects/cis250217p/ylei5/reinforce/random")
+DEFAULT_OUTPUT_DIR = Path("random")
 
 
 def random_query(unlabeled_indices: np.ndarray, query_size: int, rng: np.random.Generator):
@@ -25,7 +25,6 @@ def random_query(unlabeled_indices: np.ndarray, query_size: int, rng: np.random.
     query_size = min(query_size, len(unlabeled_indices))
     chosen = rng.choice(unlabeled_indices, size=query_size, replace=False)
     return chosen
-
 
 @torch.no_grad()
 def evaluate_on_test(
@@ -55,11 +54,13 @@ def evaluate_on_test(
     total_loss = 0.0
     total_samples = 0
 
-    for cell_emb, expr in loader:
+    for cell_emb, expr, pert_gene_ids, pert_gene_mask in loader:
         cell_emb = cell_emb.to(device)
         expr = expr.to(device)
+        pert_gene_ids = pert_gene_ids.to(device)
+        pert_gene_mask = pert_gene_mask.to(device)
 
-        pred = model(cell_emb)
+        pred = model(cell_emb, pert_gene_ids, pert_gene_mask)
         loss = criterion(pred, expr)
 
         bs = cell_emb.size(0)
