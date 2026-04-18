@@ -72,6 +72,7 @@ def run_teacher_episode(
     feature_extractor = FeatureExtractor(config)
     transitions: List[Tuple[np.ndarray, np.ndarray, int]] = []
 
+    env.freeze_predictor = True
     state = env.reset()
     done = False
 
@@ -123,6 +124,7 @@ def generate_teacher_rollouts(
         all_transitions.extend(transitions)
         logger.info(f"  Collected {len(transitions)} steps")
 
+    env.freeze_predictor = False  # restore for PPO training
     logger.info(f"Total teacher transitions: {len(all_transitions)}")
     return all_transitions
 

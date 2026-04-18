@@ -333,6 +333,12 @@ class PPOTrainer:
                 round_step_states.clear()
                 round_phi.clear()
 
+                logger.info(
+                    f"  [iter {self._ppo_iter}] round {info.get('round', '?')} done | "
+                    f"labeled={info.get('num_labeled_conds', '?')} conds | "
+                    f"reward={reward:.4f}"
+                )
+
                 # Collect per-round metrics for comparison with random baseline
                 if info:
                     round_data.append({

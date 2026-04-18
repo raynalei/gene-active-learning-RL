@@ -213,7 +213,12 @@ def main(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Stage 1 + 2: Teacher rollouts → Behaviour Cloning
     # ------------------------------------------------------------------
-    if not args.no_bc:
+    if args.bc_checkpoint:
+        logger.info(f"Loading BC checkpoint from {args.bc_checkpoint}")
+        ckpt = torch.load(args.bc_checkpoint, map_location=device)
+        policy.load_state_dict(ckpt["policy"])
+        value_net.load_state_dict(ckpt["value_net"])
+    elif not args.no_bc:
         logger.info("=" * 60)
         logger.info("Stage 1: Generating teacher rollouts...")
         teacher_transitions = generate_teacher_rollouts(env, config)
@@ -313,6 +318,8 @@ def parse_args() -> argparse.Namespace:
                              "(e.g. reward.w_cov=0 ppo.gamma=0.99)")
     parser.add_argument("--no_bc", action="store_true",
                         help="Skip Stage 2 behaviour cloning warm-start")
+    parser.add_argument("--bc_checkpoint", type=str, default=None,
+                        help="Load policy/value_net weights from a BC .pt file and skip Stages 1+2")
     parser.add_argument("--no_dyna", action="store_true",
                         help="Disable Stage 3 Dyna model-based rollout augmentation")
     return parser.parse_args()

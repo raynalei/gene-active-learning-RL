@@ -57,8 +57,6 @@ class RewardComputer:
         ood_mse_after: float,
         gene_pair_coverage_before: float,
         gene_pair_coverage_after: float,
-        pathway_coverage_before: float,
-        pathway_coverage_after: float,
         batch_embeddings: np.ndarray,       # [B, D]
         pool_uncertainty_before: float,
         pool_uncertainty_after: float,
@@ -72,7 +70,6 @@ class RewardComputer:
         ----------
         ood_mse_before / after      : OOD validation MSE before/after predictor update.
         gene_pair_coverage_before/after : fraction of unique gene pairs seen.
-        pathway_coverage_before/after   : fraction of unique pathway pairs seen.
         batch_embeddings            : embeddings of the selected batch [B, D].
         pool_uncertainty_before/after   : mean uncertainty over pool before/after.
         des_before / after          : Differential Expression Score before/after update.
@@ -84,7 +81,6 @@ class RewardComputer:
         r_ood = self._r_ood(ood_mse_before, ood_mse_after)
         r_cov = self._r_cov(
             gene_pair_coverage_before, gene_pair_coverage_after,
-            pathway_coverage_before, pathway_coverage_after,
         )
         r_red = self._r_red(batch_embeddings)
         r_unc = self._r_unc(pool_uncertainty_before, pool_uncertainty_after)
@@ -120,13 +116,9 @@ class RewardComputer:
     def _r_cov(
         pair_before: float,
         pair_after: float,
-        path_before: float,
-        path_after: float,
     ) -> float:
-        """Weighted coverage gain over gene pairs and pathway pairs."""
-        delta_pair = pair_after - pair_before
-        delta_path = path_after - path_before
-        return delta_pair + 0.5 * delta_path
+        """Coverage gain over gene pairs."""
+        return pair_after - pair_before
 
     @staticmethod
     def _r_red(batch_embeddings: np.ndarray) -> float:

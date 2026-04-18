@@ -378,6 +378,10 @@ class ALEnvironment:
         self.reward_computer = RewardComputer(config)
         self.feature_extractor = FeatureExtractor(config)
 
+        # When True, _end_of_round skips trainer.update() (used during BC
+        # teacher rollouts to avoid 400× expensive predictor retraining).
+        self.freeze_predictor: bool = False
+
         # ------------------------------------------------------------------
         # Episode state (set by reset())
         # ------------------------------------------------------------------
@@ -400,7 +404,6 @@ class ALEnvironment:
         self._test_mse: float = 0.0
         self._coverage_state: Dict[str, float] = {
             "gene_pair_coverage": 0.0,
-            "pathway_coverage": 0.0,
         }
 
     # ------------------------------------------------------------------
@@ -427,7 +430,9 @@ class ALEnvironment:
         self._round_idx = 0
 
         self._recompute_embeddings()
-        self._update_metrics()
+        # Skip _update_metrics() at reset — MSE defaults to 0.0 until round 0
+        # completes training. Avoids an expensive full-dataset eval before any
+        # predictor update has happened.
         return self._get_state()
 
     def step(
@@ -445,6 +450,14 @@ class ALEnvironment:
         selected_cond = self._pool_conds[action]
         self._current_batch_conds.append(selected_cond)
         self._pool_conds.pop(action)
+
+        # Keep cached embeddings/uncertainties in sync with _pool_conds so that
+        # within-round calls to env.pool_embeddings / env.pool_uncertainties
+        # always have the same length as _pool_conds.
+        if self._pool_embeddings is not None:
+            self._pool_embeddings = np.delete(self._pool_embeddings, action, axis=0)
+        if self._pool_uncertainties is not None:
+            self._pool_uncertainties = np.delete(self._pool_uncertainties, action, axis=0)
 
         info: Dict[str, Any] = {}
 
@@ -481,8 +494,6 @@ class ALEnvironment:
             ood_mse_after=ood_mse_after,
             gene_pair_coverage_before=cov_before["gene_pair_coverage"],
             gene_pair_coverage_after=cov_after["gene_pair_coverage"],
-            pathway_coverage_before=cov_before["pathway_coverage"],
-            pathway_coverage_after=cov_after["pathway_coverage"],
             batch_embeddings=batch_embeddings,
             pool_uncertainty_before=unc_before,
             pool_uncertainty_after=unc_after,
@@ -526,18 +537,32 @@ class ALEnvironment:
         """Mean-pool condition embedding via ensemble (for state computation)."""
         if len(cond_indices) == 0:
             return np.zeros((0, self.config["state"]["embedding_dim"]), dtype=np.float32)
-        cell_t = torch.tensor(self._mean_cell_emb[cond_indices], dtype=torch.float32).to(self.device)
-        pg_ids_t = torch.tensor(self._pg_ids[[self._cond_cell_idx[c][0] for c in cond_indices]], dtype=torch.long).to(self.device)
-        pg_mask_t = torch.tensor(self._pg_mask[[self._cond_cell_idx[c][0] for c in cond_indices]], dtype=torch.float32).to(self.device)
-        return self.ensemble.get_embedding(cell_t, pg_ids_t, pg_mask_t).cpu().numpy()
+        chunk = self.config.get("embed_batch_size", 32)
+        results = []
+        rep_cells = [self._cond_cell_idx[c][0] for c in cond_indices]
+        for i in range(0, len(cond_indices), chunk):
+            ci = cond_indices[i:i + chunk]
+            rc = rep_cells[i:i + chunk]
+            cell_t = torch.tensor(self._mean_cell_emb[ci], dtype=torch.float32).to(self.device)
+            pg_ids_t = torch.tensor(self._pg_ids[rc], dtype=torch.long).to(self.device)
+            pg_mask_t = torch.tensor(self._pg_mask[rc], dtype=torch.float32).to(self.device)
+            results.append(self.ensemble.get_embedding(cell_t, pg_ids_t, pg_mask_t).cpu().numpy())
+        return np.concatenate(results, axis=0)
 
     def _compute_uncertainties(self, cond_indices: List[int]) -> np.ndarray:
         if len(cond_indices) == 0:
             return np.zeros(0, dtype=np.float32)
-        cell_t = torch.tensor(self._mean_cell_emb[cond_indices], dtype=torch.float32).to(self.device)
-        pg_ids_t = torch.tensor(self._pg_ids[[self._cond_cell_idx[c][0] for c in cond_indices]], dtype=torch.long).to(self.device)
-        pg_mask_t = torch.tensor(self._pg_mask[[self._cond_cell_idx[c][0] for c in cond_indices]], dtype=torch.float32).to(self.device)
-        return self.ensemble.uncertainty(cell_t, pg_ids_t, pg_mask_t).cpu().numpy()
+        chunk = self.config.get("embed_batch_size", 32)
+        results = []
+        rep_cells = [self._cond_cell_idx[c][0] for c in cond_indices]
+        for i in range(0, len(cond_indices), chunk):
+            ci = cond_indices[i:i + chunk]
+            rc = rep_cells[i:i + chunk]
+            cell_t = torch.tensor(self._mean_cell_emb[ci], dtype=torch.float32).to(self.device)
+            pg_ids_t = torch.tensor(self._pg_ids[rc], dtype=torch.long).to(self.device)
+            pg_mask_t = torch.tensor(self._pg_mask[rc], dtype=torch.float32).to(self.device)
+            results.append(self.ensemble.uncertainty(cell_t, pg_ids_t, pg_mask_t).cpu().numpy())
+        return np.concatenate(results, axis=0)
 
     # ------------------------------------------------------------------
     # Round-level operations
@@ -557,7 +582,8 @@ class ALEnvironment:
         self._labeled_cells.extend(new_cells)
 
         # Train predictor on ALL labeled cells (cell-level, like random_sample.py)
-        self.trainer.update(self._build_train_data(), self._round_idx)
+        if not self.freeze_predictor:
+            self.trainer.update(self._build_train_data(), self._round_idx)
 
         # Recompute state & metrics
         self._recompute_embeddings()
@@ -631,37 +657,22 @@ class ALEnvironment:
 
         # Coverage stats
         labeled_gs = [self._gene_sets[c] for c in self._labeled_cond]
-        pair_cov, path_cov = self._compute_coverage(labeled_gs)
+        pair_cov = self._compute_coverage(labeled_gs)
         self._coverage_state = {
             "gene_pair_coverage": pair_cov,
-            "pathway_coverage": path_cov,
         }
 
-    def _compute_coverage(
-        self, labeled_gs: List[Set[str]]
-    ) -> Tuple[float, float]:
+    def _compute_coverage(self, labeled_gs: List[Set[str]]) -> float:
         seen_pairs: Set[FrozenSet] = {
             frozenset({a, b})
             for gs in labeled_gs
             for i, a in enumerate(list(gs))
             for b in list(gs)[i + 1:]
         }
-        pair_cov = (
+        return (
             len(seen_pairs & self._all_gene_pairs) / len(self._all_gene_pairs)
             if self._all_gene_pairs else 0.0
         )
-        seen_path: Set[FrozenSet] = {
-            frozenset({self._pathway_map.get(a, -1), self._pathway_map.get(b, -1)})
-            for gs in labeled_gs
-            for i, a in enumerate(list(gs))
-            for b in list(gs)[i + 1:]
-            if self._pathway_map.get(a, -1) >= 0 and self._pathway_map.get(b, -1) >= 0
-        }
-        path_cov = (
-            len(seen_path & self._all_pathway_pairs) / len(self._all_pathway_pairs)
-            if self._all_pathway_pairs else 0.0
-        )
-        return pair_cov, path_cov
 
     def _compute_true_de_sets(self, cond_indices: List[int]) -> Dict[int, Set[int]]:
         """Compute ground-truth differentially expressed gene index sets."""
