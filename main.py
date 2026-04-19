@@ -242,7 +242,9 @@ def main(args: argparse.Namespace) -> None:
     logger.info("=" * 60)
     logger.info("Stage 3: PPO fine-tuning with Dyna...")
 
-    n_ppo_iters = config["active_learning"]["num_rounds"] * 5  # configurable
+    n_ppo_iters = config.get("training", {}).get(
+        "n_ppo_iters", config["active_learning"]["num_rounds"] * 5
+    )
 
     ppo_trainer = PPOTrainer(
         env=env,
@@ -253,7 +255,19 @@ def main(args: argparse.Namespace) -> None:
         device=device,
     )
 
-    logs, round_log = ppo_trainer.train(n_ppo_iters)
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        resume_logs, resume_round_log = ppo_trainer.load_checkpoint(args.resume)
+    else:
+        resume_logs, resume_round_log = [], []
+
+    logs, round_log = ppo_trainer.train(
+        n_ppo_iters,
+        checkpoint_every=args.checkpoint_every,
+        output_dir=args.output_dir,
+    )
+    logs = resume_logs + logs
+    round_log = resume_round_log + round_log
 
     # ------------------------------------------------------------------
     # Save final checkpoint and logs
@@ -322,6 +336,10 @@ def parse_args() -> argparse.Namespace:
                         help="Load policy/value_net weights from a BC .pt file and skip Stages 1+2")
     parser.add_argument("--no_dyna", action="store_true",
                         help="Disable Stage 3 Dyna model-based rollout augmentation")
+    parser.add_argument("--checkpoint_every", type=int, default=5,
+                        help="Save a checkpoint every N PPO iterations (0 = disabled)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a checkpoint .pt file to resume PPO training from")
     return parser.parse_args()
 
 

@@ -20,8 +20,9 @@ gamma = 1.0, gae_lambda = 0.95, ppo_epochs = 4, batch_size = 64.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -47,7 +48,8 @@ class Transition:
     h_obs: np.ndarray
     h_pool: np.ndarray
     h_pb: np.ndarray
-    query_features: np.ndarray   # [P, query_dim]
+    query_features: np.ndarray   # [P, query_dim] — policy cross-attention input
+    phi_features: np.ndarray     # [P, phi_dim]   — Dyna simulator input
     action: int
     log_prob: float
     reward: float
@@ -163,7 +165,58 @@ class PPOTrainer:
     # Main training entry point
     # ------------------------------------------------------------------
 
-    def train(self, n_iterations: int) -> tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+    def save_checkpoint(
+        self,
+        path: str,
+        logs: List[Dict[str, float]],
+        round_log: List[Dict[str, float]],
+    ) -> None:
+        """Save full training state to *path*."""
+        ensemble = self.env.ensemble
+        torch.save(
+            {
+                "ppo_iter": self._ppo_iter,
+                "policy": self.policy.state_dict(),
+                "value_net": self.value_net.state_dict(),
+                "optimizer": self.optimizer.state_dict(),
+                "simulator_net": self.simulator.net.state_dict(),
+                "simulator_buffer": list(self.simulator._buffer),
+                "simulator_train_steps": self.simulator._train_steps,
+                "ensemble": [m.state_dict() for m in ensemble.members],
+                "logs": logs,
+                "round_log": round_log,
+            },
+            path,
+        )
+        logger.info(f"Checkpoint saved → {path}")
+
+    def load_checkpoint(self, path: str) -> tuple[List[Dict[str, float]], List[Dict[str, float]]]:
+        """
+        Restore training state from *path*.
+
+        Returns the accumulated (logs, round_log) so training can resume appending.
+        """
+        ckpt = torch.load(path, map_location=self.device)
+        self._ppo_iter = ckpt["ppo_iter"]
+        self.policy.load_state_dict(ckpt["policy"])
+        self.value_net.load_state_dict(ckpt["value_net"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.simulator.net.load_state_dict(ckpt["simulator_net"])
+        from collections import deque
+        self.simulator._buffer = deque(ckpt["simulator_buffer"], maxlen=self.simulator.buffer_size)
+        self.simulator._train_steps = ckpt["simulator_train_steps"]
+        ensemble = self.env.ensemble
+        for member, sd in zip(ensemble.members, ckpt["ensemble"]):
+            member.load_state_dict(sd)
+        logger.info(f"Resumed from checkpoint {path} at iter {self._ppo_iter}")
+        return ckpt["logs"], ckpt["round_log"]
+
+    def train(
+        self,
+        n_iterations: int,
+        checkpoint_every: int = 5,
+        output_dir: Optional[str] = None,
+    ) -> tuple[List[Dict[str, float]], List[Dict[str, float]]]:
         """
         Run *n_iterations* PPO iterations.
 
@@ -173,6 +226,12 @@ class PPOTrainer:
           3. Generate Dyna simulated transitions.
           4. Compute GAE.
           5. PPO update.
+
+        Parameters
+        ----------
+        n_iterations     : total number of PPO iterations to run.
+        checkpoint_every : save a checkpoint every this many iterations (0 = disabled).
+        output_dir       : directory to write checkpoints; required if checkpoint_every > 0.
 
         Returns
         -------
@@ -235,6 +294,11 @@ class PPOTrainer:
                 f"PolicyLoss: {ppo_stats.get('policy_loss', 0):.4f} | "
                 f"ValueLoss: {ppo_stats.get('value_loss', 0):.4f}"
             )
+
+            if checkpoint_every > 0 and output_dir and (self._ppo_iter + 1) % checkpoint_every == 0:
+                ckpt_path = os.path.join(output_dir, f"checkpoint_iter_{self._ppo_iter:04d}.pt")
+                self.save_checkpoint(ckpt_path, logs, round_log)
+
             self._ppo_iter += 1
 
         return logs, round_log
@@ -301,6 +365,7 @@ class PPOTrainer:
                 h_pool=state[self.h_obs_dim:self.h_obs_dim + self.h_pool_dim].copy(),
                 h_pb=state[self.h_obs_dim + self.h_pool_dim:].copy(),
                 query_features=query_feats.copy(),
+                phi_features=phi_feats.copy(),
                 action=action,
                 log_prob=log_prob,
                 reward=0.0,  # filled in at end of round
@@ -380,7 +445,7 @@ class PPOTrainer:
             state = np.concatenate([t.h_obs, t.h_pool, t.h_pb])
 
             # Use simulator to predict reward for the same action
-            phi_single = t.query_features[t.action:t.action + 1]  # [1, query_dim]
+            phi_single = t.phi_features[t.action:t.action + 1]  # [1, phi_dim]
             sim_r = self.simulator.predict(state, phi_single)
 
             # Synthesise reward (weighted sum matching RewardComputer weights)
@@ -396,6 +461,7 @@ class PPOTrainer:
                 h_pool=t.h_pool.copy(),
                 h_pb=t.h_pb.copy(),
                 query_features=t.query_features.copy(),
+                phi_features=t.phi_features.copy(),
                 action=t.action,
                 log_prob=t.log_prob,
                 reward=reward,

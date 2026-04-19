@@ -405,6 +405,18 @@ class ALEnvironment:
         self._coverage_state: Dict[str, float] = {
             "gene_pair_coverage": 0.0,
         }
+        self._des: float = 0.0  # cached DES from end of last round
+
+        # Precompute batched tensors for _compute_des (fixed across all rounds)
+        if self._ood_val_cond_indices:
+            _rep = [self._cond_cell_idx[c][0] for c in self._ood_val_cond_indices]
+            self._des_cell_t = torch.tensor(
+                self._mean_cell_emb[self._ood_val_cond_indices], dtype=torch.float32
+            )
+            self._des_pg_ids_t = torch.tensor(self._pg_ids[_rep], dtype=torch.long)
+            self._des_pg_mask_t = torch.tensor(self._pg_mask[_rep], dtype=torch.float32)
+        else:
+            self._des_cell_t = None
 
     # ------------------------------------------------------------------
     # Gym interface
@@ -569,11 +581,11 @@ class ALEnvironment:
     # ------------------------------------------------------------------
 
     def _end_of_round(self) -> Tuple[float, Dict[str, Any]]:
-        # Snapshot before
+        # Snapshot before (reuse cached DES from previous round — avoids redundant forward pass)
         ood_before = self._ood_val_mse
         cov_before = dict(self._coverage_state)
         unc_before = float(self._pool_uncertainties.mean()) if len(self._pool_uncertainties) > 0 else 0.0
-        des_before = self._compute_des()
+        des_before = self._des
 
         # Move batch conditions → labeled; reveal cell-level labels from oracle
         batch_names = [self._cond_names[c] for c in self._current_batch_conds]
@@ -593,6 +605,7 @@ class ALEnvironment:
         cov_after = dict(self._coverage_state)
         unc_after = float(self._pool_uncertainties.mean()) if len(self._pool_uncertainties) > 0 else 0.0
         des_after = self._compute_des()
+        self._des = des_after  # cache for next round's des_before
 
         batch_embs = self._embed_conditions(self._current_batch_conds)
         reward_dict = self.compute_reward(
@@ -692,29 +705,27 @@ class ALEnvironment:
         Differential Expression Score on the OOD validation set.
 
         DES = (1/|T|) * sum_{p in T} |G_true(p) ∩ G_pred(p)| / |G_true(p)|
+
+        Batches all OOD val conditions in a single forward pass for speed.
         """
-        if not self._ood_val_cond_indices:
+        if not self._ood_val_cond_indices or self._des_cell_t is None:
             return 0.0
+
+        with torch.no_grad():
+            pred = self.ensemble.predict(
+                self._des_cell_t.to(self.device),
+                self._des_pg_ids_t.to(self.device),
+                self._des_pg_mask_t.to(self.device),
+            )  # [C, G]
+        pred_expr = pred.cpu().numpy()  # [C, G]
+
         total = 0.0
         count = 0
-        for c in self._ood_val_cond_indices:
+        for i, c in enumerate(self._ood_val_cond_indices):
             g_true = self._ood_val_true_de.get(c, set())
             if not g_true:
                 continue
-            cell_t = torch.tensor(
-                self._mean_cell_emb[[c]], dtype=torch.float32
-            ).to(self.device)
-            rep_cell = self._cond_cell_idx[c][0]
-            pg_ids_t = torch.tensor(
-                self._pg_ids[[rep_cell]], dtype=torch.long
-            ).to(self.device)
-            pg_mask_t = torch.tensor(
-                self._pg_mask[[rep_cell]], dtype=torch.float32
-            ).to(self.device)
-            with torch.no_grad():
-                pred = self.ensemble.predict(cell_t, pg_ids_t, pg_mask_t)
-            pred_expr = pred[0].cpu().numpy()
-            diff_pred = np.abs(pred_expr - self._ctrl_expr)
+            diff_pred = np.abs(pred_expr[i] - self._ctrl_expr)
             g_pred = set(np.where(diff_pred > self._de_threshold)[0].tolist())
             total += len(g_true & g_pred) / len(g_true)
             count += 1
