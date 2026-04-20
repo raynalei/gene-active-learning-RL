@@ -15,7 +15,7 @@ predictor:
 active_learning:
   batch_size: 16
   num_rounds: 20
-  initial_labeled_size: 32
+  initial_labeled_size: 4
   ood_val_fraction: 0.2
   ood_split_seed: 42
   test_ratio: 0.2
