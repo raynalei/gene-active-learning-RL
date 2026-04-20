@@ -1,0 +1,80 @@
+predictor:
+  model_dim: 256
+  num_heads: 4             # 8→4
+  num_layers: 2            # 4→2: ~2x faster forward pass
+  ff_dim: 256              # 512→256
+  dropout: 0.1
+  ensemble_size: 2         # 5→2: 60% less training + eval
+  finetune_epochs: 3       # 10→3
+  full_retrain_epochs: 3   # 10→3
+  full_retrain_every: 999  # never full retrain — always finetune (much faster)
+  batch_size: 64           # 32→64: fewer gradient steps
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+
+active_learning:
+  batch_size: 16
+  num_rounds: 20
+  initial_labeled_size: 32
+  ood_val_fraction: 0.2
+  ood_split_seed: 42
+  test_ratio: 0.2
+  id_val_ratio: 0.1
+
+training:
+  n_ppo_iters: 20
+
+state:
+  h_obs_dim: 518
+  h_pool_dim: 788
+  h_pb_dim: 516
+  state_dim: 1822
+  embedding_dim: 256
+  uncertainty_bins: 10
+  distance_bins: 10
+  top_uncertainty_fraction: 0.1
+  candidate_query_dim: 259
+
+policy:
+  cross_attn_dim: 128
+  n_state_tokens: 3
+  value_hidden_dim: 256
+
+simulator:
+  hidden_dim: 256
+  lr: 1.0e-3
+  n_outputs: 3
+  buffer_size: 2000
+  min_samples_to_train: 10
+
+bc:
+  n_teacher_episodes: 10   # 20→10
+  epochs: 10               # 20→10
+  lr: 1.0e-3
+  teacher_uncertainty_weight: 1.0
+  teacher_distance_weight: 0.2
+  teacher_batch_distance_weight: 0.2
+
+ppo:
+  clip_epsilon: 0.2
+  lr: 3.0e-4
+  entropy_coef: 0.01
+  value_coef: 0.5
+  gamma: 1.0
+  gae_lambda: 0.95
+  ppo_epochs_per_update: 4
+  ppo_batch_size: 64
+  dyna_ratio_early: 2
+  dyna_ratio_late: 4
+  dyna_transition_step: 10
+  max_grad_norm: 0.5
+
+reward:
+  w_ood: 1.0
+  w_cov: 0.2
+  w_red: 0.1
+  w_unc: 0.1
+  w_des: 0.5
+
+device: "cuda"
+seed: 42
