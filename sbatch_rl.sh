@@ -2,7 +2,7 @@
 #SBATCH -A cis250217p
 #SBATCH -p GPU-shared
 #SBATCH --gres=gpu:v100-32:1
-#SBATCH -t 15:00:00
+#SBATCH -t 20:00:00
 #SBATCH -N 1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
@@ -53,4 +53,4 @@ python main.py \
     --seed            42 \
     --checkpoint_every 1 \
     --bc_checkpoint results/rl/seed42/policy_bc.pt \
-    --override active_learning.batch_size=8
+    --override active_learning.batch_size=2
