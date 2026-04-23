@@ -327,9 +327,9 @@ def parse_args() -> argparse.Namespace:
                         help="torch device: 'cuda' or 'cpu' (overrides config)")
     parser.add_argument("--seed", type=int, default=None,
                         help="Random seed (overrides config seed)")
-    parser.add_argument("--override", type=str, nargs="*", default=[],
+    parser.add_argument("--override", type=str, action="append", default=[],
                         help="Override config values: section.key=value "
-                             "(e.g. reward.w_cov=0 ppo.gamma=0.99)")
+                             "(e.g. --override reward.w_cov=0 --override ppo.gamma=0.99)")
     parser.add_argument("--no_bc", action="store_true",
                         help="Skip Stage 2 behaviour cloning warm-start")
     parser.add_argument("--bc_checkpoint", type=str, default=None,

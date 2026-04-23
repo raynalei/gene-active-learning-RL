@@ -14,7 +14,7 @@ predictor:
 eval_every_rounds: 5
 
 active_learning:
-  batch_size: 16           # B: number of experiments per round
+  batch_size: 1          # B: number of experiments per round
   num_rounds: 20           # total AL rounds
   initial_labeled_size: 32 # conditions in D_0
   ood_val_fraction: 0.2    # fraction of OOD-1 candidates held as fixed val set
@@ -83,3 +83,6 @@ reward:
 
 device: "cuda"
 seed: 42
+
+training:
+  n_ppo_iters: 100

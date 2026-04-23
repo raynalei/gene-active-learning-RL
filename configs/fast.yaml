@@ -13,8 +13,8 @@ predictor:
   weight_decay: 1.0e-5
 
 active_learning:
-  batch_size: 16
-  num_rounds: 20
+  batch_size: 2
+  num_rounds: 10
   initial_labeled_size: 4
   ood_val_fraction: 0.2
   ood_split_seed: 42

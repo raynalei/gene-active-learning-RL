@@ -1,8 +1,36 @@
+"""
+Condition-level active learning baselines.
+
+Three query strategies — random, uncertainty (MC dropout or ensemble variance),
+and diversity — all operating at **condition level** to match the RL framework
+(ALEnvironment).
+
+Mirrors ALEnvironment exactly:
+  - Same cell-level splits (test 20%, id_val 10%, pool rest)
+  - Same OOD-1 condition exclusion from pool
+  - Selection at condition level (not cell level)
+  - Labeling reveals all pool-eligible cells of the queried condition
+  - initial_labeled_size = 4 conditions (matches configs/default.yaml)
+
+Usage
+-----
+python baseline.py \
+    --gene_embeddings path/to/gene_embs.npy \
+    --cell_embeddings path/to/cell_embs.npy \
+    --h5ad            path/to/norman2019.h5ad \
+    --query_strategy  uncertainty_ensemble \
+    [--initial_labeled_size 4]  \
+    [--query_size 16]           \
+    [--rounds 20]
+"""
+
 import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+import yaml
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,365 +45,70 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from predict import (
-    load_expression_from_h5ad,
     sanitize_gene_embeddings,
     get_cached_pert_gene_ids,
     get_cached_pert_gene_mask,
     get_cached_num_guides,
-    build_dataloader,
+    _parse_guide_merged,
+    _encode_guide_merged,
+    ExpressionDataset,
+    train_one_epoch,
+    evaluate,
 )
 from predictor.ensemble import EnsemblePredictor
-from predictor.trainer import PredictorTrainer
 
-DEFAULT_OUTPUT_DIR = Path("random")
-
-
-def random_query(unlabeled_indices: np.ndarray, query_size: int, rng: np.random.Generator):
-    """Randomly sample new instances from the unlabeled pool."""
-    query_size = min(query_size, len(unlabeled_indices))
-    return rng.choice(unlabeled_indices, size=query_size, replace=False)
+DEFAULT_OUTPUT_DIR = Path("baselines")
 
 
-def enable_dropout_in_eval(model: nn.Module) -> None:
-    """Keep dropout active for MC dropout while leaving the rest of the model in eval mode."""
-    for module in model.modules():
-        if isinstance(module, nn.Dropout):
-            module.train()
+# ---------------------------------------------------------------------------
+# Condition map (mirrors _load_norman2019 in al_env.py)
+# ---------------------------------------------------------------------------
+
+def _build_condition_map(adata) -> Tuple[List[str], List[List[int]], List[Set[str]]]:
+    """
+    Parse guide_merged to build condition → cell index mapping.
+
+    Returns
+    -------
+    cond_names        : list of unique condition name strings
+    cond_cell_indices : cond_cell_indices[c] = list of cell indices for condition c
+    gene_sets         : gene_sets[c] = set of perturbed genes for condition c
+    """
+    guide_values = adata.obs["guide_merged"].tolist()
+    parsed = [_parse_guide_merged(v) for v in guide_values]
+    guide_strings = ["+".join(gs) if gs else "ctrl" for gs in parsed]
+    unique_guides = list(dict.fromkeys(guide_strings))
+
+    name2idx = {n: i for i, n in enumerate(unique_guides)}
+    cond_cell_indices: List[List[int]] = [[] for _ in unique_guides]
+    for cell_i, gs in enumerate(guide_strings):
+        cond_cell_indices[name2idx[gs]].append(cell_i)
+
+    gene_sets = [set(parsed[cond_cell_indices[c][0]]) for c in range(len(unique_guides))]
+    return unique_guides, cond_cell_indices, gene_sets
 
 
-@torch.no_grad()
-def uncertainty_query(
-    model,
-    cell_embeddings: np.ndarray,
-    expression_matrix: np.ndarray,
-    unlabeled_indices: np.ndarray,
-    query_size: int,
-    batch_size: int,
-    num_workers: int,
-    mc_dropout_passes: int,
-    device: str,
-) -> np.ndarray:
-    """Select instances with the largest predictive variance estimated by MC dropout."""
-    query_size = min(query_size, len(unlabeled_indices))
-    mc_dropout_passes = max(1, mc_dropout_passes)
-    if query_size == 0:
-        return np.array([], dtype=np.int64)
+# ---------------------------------------------------------------------------
+# OOD-1 split (mirrors _build_ood_split in al_env.py)
+# ---------------------------------------------------------------------------
 
-    loader = build_dataloader(
-        cell_embeddings=cell_embeddings,
-        expression_matrix=expression_matrix,
-        indices=unlabeled_indices,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-
-    model = model.to(device)
-    model.eval()
-    enable_dropout_in_eval(model)
-
-    uncertainty_scores = []
-    n_pool = len(unlabeled_indices)
-    n_batches = len(loader)
-    pbar = tqdm(
-        loader,
-        desc="Uncertainty (MC dropout)",
-        leave=False,
-        unit="batch",
-        total=n_batches,
-        dynamic_ncols=True,
-    )
-    for cell_emb, _, pert_gene_ids, pert_gene_mask in pbar:
-        cell_emb = cell_emb.to(device)
-        pert_gene_ids = pert_gene_ids.to(device)
-        pert_gene_mask = pert_gene_mask.to(device)
-
-        mc_predictions = []
-        for _ in range(mc_dropout_passes):
-            pred = model(cell_emb, pert_gene_ids, pert_gene_mask)
-            mc_predictions.append(pred.unsqueeze(0))
-
-        stacked = torch.cat(mc_predictions, dim=0)
-        predictive_var = stacked.var(dim=0, unbiased=False).mean(dim=1)
-        uncertainty_scores.append(predictive_var.cpu())
-        pbar.set_postfix(
-            pool=n_pool,
-            pick=query_size,
-            mc=mc_dropout_passes,
-            refresh=False,
-        )
-
-    scores = torch.cat(uncertainty_scores, dim=0).numpy()
-    kth = scores.shape[0] - query_size
-    topk = np.argpartition(scores, kth)[kth:]
-    topk = topk[np.argsort(scores[topk])[::-1]]
-    return unlabeled_indices[topk]
+def _build_ood_split(
+    gene_sets: List[Set[str]],
+    ood_val_fraction: float,
+    seed: int,
+) -> Tuple[List[int], List[int]]:
+    """OOD-1: double knockouts where both genes appear as single knockouts."""
+    single_genes: Set[str] = {g for gs in gene_sets if len(gs) == 1 for g in gs}
+    ood1 = [i for i, gs in enumerate(gene_sets) if len(gs) == 2 and gs.issubset(single_genes)]
+    rng = np.random.default_rng(seed)
+    rng.shuffle(ood1)
+    n_val = max(1, int(ood_val_fraction * len(ood1)))
+    return ood1[:n_val], ood1[n_val:]
 
 
-@torch.no_grad()
-def uncertainty_ensemble_query(
-    ensemble: EnsemblePredictor,
-    cell_embeddings: np.ndarray,
-    expression_matrix: np.ndarray,
-    unlabeled_indices: np.ndarray,
-    query_size: int,
-    batch_size: int,
-    num_workers: int,
-    device: str,
-) -> np.ndarray:
-    """Select instances with the largest predictive variance across ensemble members (epistemic)."""
-    query_size = min(query_size, len(unlabeled_indices))
-    if query_size == 0:
-        return np.array([], dtype=np.int64)
-
-    loader = build_dataloader(
-        cell_embeddings=cell_embeddings,
-        expression_matrix=expression_matrix,
-        indices=unlabeled_indices,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-    )
-
-    ensemble = ensemble.to(device)
-    ensemble.eval()
-
-    uncertainty_scores = []
-    n_pool = len(unlabeled_indices)
-    n_batches = len(loader)
-    pbar = tqdm(
-        loader,
-        desc="Uncertainty (ensemble)",
-        leave=False,
-        unit="batch",
-        total=n_batches,
-        dynamic_ncols=True,
-    )
-    for cell_emb, _, pert_gene_ids, pert_gene_mask in pbar:
-        cell_emb = cell_emb.to(device)
-        pert_gene_ids = pert_gene_ids.to(device)
-        pert_gene_mask = pert_gene_mask.to(device)
-
-        u = ensemble.uncertainty(cell_emb, pert_gene_ids, pert_gene_mask)
-        uncertainty_scores.append(u.cpu())
-        pbar.set_postfix(
-            pool=n_pool,
-            pick=query_size,
-            members=len(ensemble.members),
-            refresh=False,
-        )
-
-    scores = torch.cat(uncertainty_scores, dim=0).numpy()
-    kth = scores.shape[0] - query_size
-    topk = np.argpartition(scores, kth)[kth:]
-    topk = topk[np.argsort(scores[topk])[::-1]]
-    return unlabeled_indices[topk]
-
-
-@torch.no_grad()
-def compute_perturbation_representations(
-    model,
-    indices: np.ndarray,
-    num_cells: int,
-    device: str,
-    batch_size: int = 1024,
-    show_progress: bool = False,
-    progress_desc: str = "Pert embeddings",
-) -> torch.Tensor:
-    """Build one perturbation embedding per cell by averaging perturbed-gene embeddings."""
-    pert_gene_ids = get_cached_pert_gene_ids(num_cells)
-    pert_gene_mask = get_cached_pert_gene_mask(num_cells)
-    representations = []
-
-    model = model.to(device)
-    model.eval()
-
-    n = len(indices)
-    n_batches = (n + batch_size - 1) // batch_size if n else 0
-    batch_starts = range(0, n, batch_size)
-    if show_progress and n_batches > 0:
-        batch_starts = tqdm(
-            batch_starts,
-            total=n_batches,
-            desc=progress_desc,
-            leave=False,
-            unit="batch",
-            dynamic_ncols=True,
-        )
-
-    for start in batch_starts:
-        batch_indices = indices[start:start + batch_size]
-        batch_gene_ids = torch.tensor(
-            pert_gene_ids[batch_indices],
-            dtype=torch.long,
-            device=device,
-        )
-        batch_gene_mask = torch.tensor(
-            pert_gene_mask[batch_indices],
-            dtype=torch.float32,
-            device=device,
-        )
-
-        gene_embs = model.pert_gene_emb(batch_gene_ids)
-        mask = batch_gene_mask.unsqueeze(-1)
-        counts = mask.sum(dim=1)
-        pert_sum = (gene_embs * mask).sum(dim=1)
-        avg_pert = pert_sum / counts.clamp_min(1.0)
-        ctrl_context = model.ctrl_embedding.unsqueeze(0).expand(len(batch_indices), -1)
-        batch_repr = torch.where(counts > 0, avg_pert, ctrl_context)
-        representations.append(batch_repr)
-
-    return torch.cat(representations, dim=0)
-
-
-def min_distance_to_reference(
-    candidates: torch.Tensor,
-    reference: torch.Tensor,
-    chunk_size: int = 1024,
-) -> torch.Tensor:
-    """Compute each candidate's minimum Euclidean distance to the reference set."""
-    if reference.numel() == 0:
-        return torch.full(
-            (candidates.shape[0],),
-            float("inf"),
-            device=candidates.device,
-        )
-
-    min_distances = []
-    for start in range(0, candidates.shape[0], chunk_size):
-        chunk = candidates[start:start + chunk_size]
-        distances = torch.cdist(chunk, reference)
-        min_distances.append(distances.min(dim=1).values)
-
-    return torch.cat(min_distances, dim=0)
-
-
-@torch.no_grad()
-def diversity_query(
-    model,
-    labeled_indices: np.ndarray,
-    unlabeled_indices: np.ndarray,
-    query_size: int,
-    num_cells: int,
-    device: str,
-    representation_batch_size: int = 1024,
-    distance_chunk_size: int = 1024,
-) -> np.ndarray:
-    """Greedily choose perturbations farthest from the labeled set in perturbation space."""
-    query_size = min(query_size, len(unlabeled_indices))
-    if query_size == 0:
-        return np.array([], dtype=np.int64)
-
-    labeled_repr = compute_perturbation_representations(
-        model=model,
-        indices=labeled_indices,
-        num_cells=num_cells,
-        device=device,
-        batch_size=representation_batch_size,
-        show_progress=True,
-        progress_desc="Diversity: labeled → repr",
-    )
-    unlabeled_repr = compute_perturbation_representations(
-        model=model,
-        indices=unlabeled_indices,
-        num_cells=num_cells,
-        device=device,
-        batch_size=representation_batch_size,
-        show_progress=True,
-        progress_desc="Diversity: unlabeled → repr",
-    )
-
-    min_distances = min_distance_to_reference(
-        candidates=unlabeled_repr,
-        reference=labeled_repr,
-        chunk_size=distance_chunk_size,
-    )
-    available = torch.ones(len(unlabeled_indices), dtype=torch.bool, device=device)
-    selected_positions = []
-
-    greedy_iter = range(query_size)
-    greedy_iter = tqdm(
-        greedy_iter,
-        desc="Diversity: greedy pick",
-        leave=False,
-        unit="pick",
-        total=query_size,
-        dynamic_ncols=True,
-    )
-    for _ in greedy_iter:
-        masked_distances = min_distances.masked_fill(~available, float("-inf"))
-        next_position = int(torch.argmax(masked_distances).item())
-        if not torch.isfinite(masked_distances[next_position]):
-            break
-
-        selected_positions.append(next_position)
-        available[next_position] = False
-
-        new_reference = unlabeled_repr[next_position:next_position + 1]
-        for start in range(0, unlabeled_repr.shape[0], distance_chunk_size):
-            chunk = unlabeled_repr[start:start + distance_chunk_size]
-            distances = torch.cdist(chunk, new_reference).squeeze(1)
-            min_distances[start:start + distance_chunk_size] = torch.minimum(
-                min_distances[start:start + distance_chunk_size],
-                distances,
-            )
-
-    return unlabeled_indices[np.array(selected_positions, dtype=np.int64)]
-
-
-def query_unlabeled_pool(
-    strategy: str,
-    model,
-    labeled_indices: np.ndarray,
-    unlabeled_indices: np.ndarray,
-    query_size: int,
-    rng: np.random.Generator,
-    cell_embeddings: np.ndarray,
-    expression_matrix: np.ndarray,
-    batch_size: int,
-    num_workers: int,
-    mc_dropout_passes: int,
-    device: str,
-    ensemble: Optional[EnsemblePredictor] = None,
-) -> np.ndarray:
-    if strategy == "random":
-        return random_query(unlabeled_indices, query_size, rng)
-    if strategy == "uncertainty":
-        return uncertainty_query(
-            model=model,
-            cell_embeddings=cell_embeddings,
-            expression_matrix=expression_matrix,
-            unlabeled_indices=unlabeled_indices,
-            query_size=query_size,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            mc_dropout_passes=mc_dropout_passes,
-            device=device,
-        )
-    if strategy == "uncertainty_ensemble":
-        if ensemble is None:
-            raise ValueError("uncertainty_ensemble requires ensemble=...")
-        return uncertainty_ensemble_query(
-            ensemble=ensemble,
-            cell_embeddings=cell_embeddings,
-            expression_matrix=expression_matrix,
-            unlabeled_indices=unlabeled_indices,
-            query_size=query_size,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            device=device,
-        )
-    if strategy == "diversity":
-        return diversity_query(
-            model=model,
-            labeled_indices=labeled_indices,
-            unlabeled_indices=unlabeled_indices,
-            query_size=query_size,
-            num_cells=cell_embeddings.shape[0],
-            device=device,
-        )
-    raise ValueError(f"Unknown query strategy: {strategy}")
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _build_data_dict(
     cell_embeddings: np.ndarray,
@@ -383,7 +116,7 @@ def _build_data_dict(
     pert_gene_ids: np.ndarray,
     pert_gene_mask: np.ndarray,
     indices: np.ndarray,
-) -> dict:
+) -> Dict:
     idx = np.asarray(indices, dtype=np.int64)
     return {
         "cell_embeddings": cell_embeddings[idx],
@@ -393,30 +126,294 @@ def _build_data_dict(
     }
 
 
+def _query_cells(
+    cond_indices: List[int],
+    cond_cell_indices: List[List[int]],
+    pool_cell_set: Set[int],
+) -> List[int]:
+    """Return pool-eligible cell indices for queried conditions."""
+    cells = []
+    for c in cond_indices:
+        for ci in cond_cell_indices[c]:
+            if ci in pool_cell_set:
+                cells.append(ci)
+    return cells
+
+
+def _condition_tensors(
+    cond_indices: List[int],
+    cond_cell_indices: List[List[int]],
+    cell_embeddings: np.ndarray,
+    pert_gene_ids: np.ndarray,
+    pert_gene_mask: np.ndarray,
+    device: str,
+    chunk_size: int = 256,
+):
+    """
+    Yield (mean_cell_emb_t, pg_ids_t, pg_mask_t, slice) for each chunk.
+
+    mean_cell_emb : mean over all cells of the condition  — matches _mean_cell_emb[c]
+                    in ALEnvironment.
+    pg_ids / mask : from the first representative cell    — same for every cell of
+                    a condition, matches _pg_ids[_cond_cell_idx[c][0]].
+    """
+    n = len(cond_indices)
+    for start in range(0, n, chunk_size):
+        chunk = cond_indices[start:start + chunk_size]
+        mean_embs = np.stack([
+            cell_embeddings[cond_cell_indices[c]].mean(axis=0) for c in chunk
+        ])
+        rep_cells = [cond_cell_indices[c][0] for c in chunk]
+        cell_t = torch.tensor(mean_embs, dtype=torch.float32).to(device)
+        pg_ids_t = torch.tensor(pert_gene_ids[rep_cells], dtype=torch.long).to(device)
+        pg_mask_t = torch.tensor(pert_gene_mask[rep_cells], dtype=torch.float32).to(device)
+        yield cell_t, pg_ids_t, pg_mask_t, slice(start, start + len(chunk))
+
+
+# ---------------------------------------------------------------------------
+# Query strategies (condition-level)
+# ---------------------------------------------------------------------------
+
+def enable_dropout_in_eval(model: nn.Module) -> None:
+    """Keep dropout active for MC dropout while leaving the rest of the model in eval mode."""
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.train()
+
+
+@torch.no_grad()
+def uncertainty_ensemble_query(
+    ensemble: EnsemblePredictor,
+    pool_conds: List[int],
+    cond_cell_indices: List[List[int]],
+    cell_embeddings: np.ndarray,
+    pert_gene_ids: np.ndarray,
+    pert_gene_mask: np.ndarray,
+    query_size: int,
+    device: str,
+) -> List[int]:
+    """
+    Score each pool condition by ensemble variance (epistemic uncertainty),
+    using mean cell embedding per condition — identical to ALEnvironment._compute_uncertainties.
+    """
+    query_size = min(query_size, len(pool_conds))
+    if query_size == 0:
+        return []
+
+    ensemble.to(device)
+    ensemble.eval()
+
+    scores = np.empty(len(pool_conds), dtype=np.float32)
+    for cell_t, pg_ids_t, pg_mask_t, sl in _condition_tensors(
+        pool_conds, cond_cell_indices, cell_embeddings, pert_gene_ids, pert_gene_mask, device
+    ):
+        scores[sl] = ensemble.uncertainty(cell_t, pg_ids_t, pg_mask_t).cpu().numpy()
+
+    topk_pos = np.argpartition(scores, -query_size)[-query_size:]
+    topk_pos = topk_pos[np.argsort(scores[topk_pos])[::-1]]
+    return [pool_conds[i] for i in topk_pos]
+
+
+def uncertainty_mc_query(
+    ensemble: EnsemblePredictor,
+    pool_conds: List[int],
+    cond_cell_indices: List[List[int]],
+    cell_embeddings: np.ndarray,
+    pert_gene_ids: np.ndarray,
+    pert_gene_mask: np.ndarray,
+    query_size: int,
+    mc_dropout_passes: int,
+    device: str,
+) -> List[int]:
+    """
+    Score each pool condition by predictive variance via MC dropout on the first
+    ensemble member, using mean cell embedding per condition.
+    """
+    query_size = min(query_size, len(pool_conds))
+    if query_size == 0:
+        return []
+
+    model = ensemble.members[0].to(device)
+    model.eval()
+    enable_dropout_in_eval(model)
+
+    scores = np.empty(len(pool_conds), dtype=np.float32)
+    for cell_t, pg_ids_t, pg_mask_t, sl in _condition_tensors(
+        pool_conds, cond_cell_indices, cell_embeddings, pert_gene_ids, pert_gene_mask, device
+    ):
+        mc_preds = []
+        for _ in range(max(1, mc_dropout_passes)):
+            with torch.no_grad():
+                pred = model(cell_t, pg_ids_t, pg_mask_t)   # [B, G]
+            mc_preds.append(pred.unsqueeze(0))
+        stacked = torch.cat(mc_preds, dim=0)                # [T, B, G]
+        var = stacked.var(dim=0, unbiased=False).mean(dim=1)  # [B]
+        scores[sl] = var.cpu().numpy()
+
+    topk_pos = np.argpartition(scores, -query_size)[-query_size:]
+    topk_pos = topk_pos[np.argsort(scores[topk_pos])[::-1]]
+    return [pool_conds[i] for i in topk_pos]
+
+
+@torch.no_grad()
+def diversity_query(
+    ensemble: EnsemblePredictor,
+    labeled_conds: List[int],
+    pool_conds: List[int],
+    cond_cell_indices: List[List[int]],
+    cell_embeddings: np.ndarray,
+    pert_gene_ids: np.ndarray,
+    pert_gene_mask: np.ndarray,
+    query_size: int,
+    device: str,
+) -> List[int]:
+    """
+    Greedy max-distance selection in ensemble embedding space — mirrors the
+    pool_embeddings used by ALEnvironment (ensemble.get_embedding with mean cell emb).
+    """
+    query_size = min(query_size, len(pool_conds))
+    if query_size == 0:
+        return []
+
+    ensemble.to(device)
+    ensemble.eval()
+
+    def _embed(cond_list: List[int]) -> torch.Tensor:
+        parts = []
+        for cell_t, pg_ids_t, pg_mask_t, _ in _condition_tensors(
+            cond_list, cond_cell_indices, cell_embeddings, pert_gene_ids, pert_gene_mask, device
+        ):
+            parts.append(ensemble.get_embedding(cell_t, pg_ids_t, pg_mask_t).cpu())
+        return torch.cat(parts, dim=0)  # [N, D]
+
+    labeled_repr = _embed(labeled_conds) if labeled_conds else torch.empty(0)
+    pool_repr = _embed(pool_conds)       # [P, D]
+
+    # min distance of each pool condition to the labeled set
+    if labeled_repr.numel() == 0:
+        min_dists = torch.full((len(pool_conds),), float("inf"))
+    else:
+        min_dists = torch.cdist(pool_repr, labeled_repr.to(pool_repr.device)).min(dim=1).values
+
+    available = torch.ones(len(pool_conds), dtype=torch.bool)
+    selected: List[int] = []
+
+    for _ in tqdm(range(query_size), desc="Diversity: greedy pick", leave=False,
+                  unit="pick", dynamic_ncols=True):
+        masked = min_dists.masked_fill(~available, float("-inf"))
+        best = int(torch.argmax(masked).item())
+        if not torch.isfinite(masked[best]):
+            break
+        selected.append(pool_conds[best])
+        available[best] = False
+        # update min distances with the newly selected condition
+        new_dists = torch.cdist(
+            pool_repr, pool_repr[best:best + 1]
+        ).squeeze(1)
+        min_dists = torch.minimum(min_dists, new_dists)
+
+    return selected
+
+
+def query_condition_pool(
+    strategy: str,
+    ensemble: EnsemblePredictor,
+    labeled_conds: List[int],
+    pool_conds: List[int],
+    cond_cell_indices: List[List[int]],
+    cell_embeddings: np.ndarray,
+    pert_gene_ids: np.ndarray,
+    pert_gene_mask: np.ndarray,
+    query_size: int,
+    rng: np.random.Generator,
+    mc_dropout_passes: int,
+    device: str,
+) -> List[int]:
+    if strategy == "random":
+        n = min(query_size, len(pool_conds))
+        chosen = rng.choice(len(pool_conds), size=n, replace=False).tolist()
+        return [pool_conds[i] for i in chosen]
+
+    if strategy == "uncertainty":
+        return uncertainty_mc_query(
+            ensemble=ensemble,
+            pool_conds=pool_conds,
+            cond_cell_indices=cond_cell_indices,
+            cell_embeddings=cell_embeddings,
+            pert_gene_ids=pert_gene_ids,
+            pert_gene_mask=pert_gene_mask,
+            query_size=query_size,
+            mc_dropout_passes=mc_dropout_passes,
+            device=device,
+        )
+
+    if strategy == "uncertainty_ensemble":
+        return uncertainty_ensemble_query(
+            ensemble=ensemble,
+            pool_conds=pool_conds,
+            cond_cell_indices=cond_cell_indices,
+            cell_embeddings=cell_embeddings,
+            pert_gene_ids=pert_gene_ids,
+            pert_gene_mask=pert_gene_mask,
+            query_size=query_size,
+            device=device,
+        )
+
+    if strategy == "diversity":
+        return diversity_query(
+            ensemble=ensemble,
+            labeled_conds=labeled_conds,
+            pool_conds=pool_conds,
+            cond_cell_indices=cond_cell_indices,
+            cell_embeddings=cell_embeddings,
+            pert_gene_ids=pert_gene_ids,
+            pert_gene_mask=pert_gene_mask,
+            query_size=query_size,
+            device=device,
+        )
+
+    raise ValueError(f"Unknown query strategy: {strategy!r}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Condition-level AL baselines (random / uncertainty / diversity)"
+    )
 
     parser.add_argument("--gene_embeddings", type=str, required=True,
                         help="Path to gene embedding .npy, shape [G, Dg]")
     parser.add_argument("--cell_embeddings", type=str, required=True,
                         help="Path to cell embedding .npy, shape [N, Dc]")
     parser.add_argument("--h5ad", type=str, required=True,
-                        help="Path to h5ad file. adata.X must be [N, G]")
+                        help="Path to h5ad file with guide_merged obs column")
 
-    parser.add_argument("--initial_labeled_size", type=int, default=100)
-    parser.add_argument("--query_size", type=int, default=100)
-    parser.add_argument("--rounds", type=int, default=10)
+    # Condition-level AL parameters — mirror ALEnvironment / configs/default.yaml
+    parser.add_argument("--initial_labeled_size", type=int, default=4,
+                        help="Number of conditions in initial labeled set D_0")
+    parser.add_argument("--query_size", type=int, default=1,
+                        help="Conditions to query per round "
+                             "(mirrors active_learning.batch_size=16)")
+    parser.add_argument("--rounds", type=int, default=20,
+                        help="Total AL rounds")
 
-    # Fixed val set: carved from trainable cells before AL loop (matches RL env)
-    parser.add_argument("--id_val_ratio", type=float, default=0.1)
+    # Data splits — must match ALEnvironment to ensure identical test set
     parser.add_argument("--test_ratio", type=float, default=0.2)
+    parser.add_argument("--id_val_ratio", type=float, default=0.1)
+    parser.add_argument("--ood_val_fraction", type=float, default=0.2)
+    parser.add_argument("--ood_split_seed", type=int, default=42)
     parser.add_argument("--seed", type=int, default=42)
 
+    # Predictor hyperparameters — defaults match configs/default.yaml
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-5)
-    parser.add_argument("--epochs", type=int, default=10)
-
+    parser.add_argument("--epochs", type=int, default=3,
+                        help="Training epochs per round per member "
+                             "(mirrors PredictorTrainer finetune_epochs=3)")
     parser.add_argument("--ensemble_size", type=int, default=5)
     parser.add_argument("--model_dim", type=int, default=256)
     parser.add_argument("--num_heads", type=int, default=8)
@@ -432,7 +429,7 @@ def main():
         choices=["random", "uncertainty", "uncertainty_ensemble", "diversity"],
         help=(
             "random | uncertainty (MC dropout on first member) | "
-            "uncertainty_ensemble (variance across ensemble members) | diversity."
+            "uncertainty_ensemble (variance across ensemble members) | diversity"
         ),
     )
     parser.add_argument(
@@ -441,67 +438,109 @@ def main():
         default=8,
         help="Stochastic forward passes for --query_strategy uncertainty (MC dropout) only.",
     )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=0,
-        help="DataLoader workers for uncertainty query (0 = main process only).",
-    )
 
-    parser.add_argument("--method_name", type=str, default="Random")
-    parser.add_argument(
-        "--save_curve",
-        type=str,
-        default=str(DEFAULT_OUTPUT_DIR / "random_al_curve.png"),
-    )
-    parser.add_argument(
-        "--save_curve_csv",
-        type=str,
-        default=str(DEFAULT_OUTPUT_DIR / "random_al_curve.csv"),
-    )
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config (e.g. configs/fast.yaml). "
+                             "Values are applied as defaults; explicit CLI flags take priority.")
+    parser.add_argument("--method_name", type=str, default=None,
+                        help="Display name in output (default: derived from query_strategy)")
+    parser.add_argument("--save_curve", type=str,
+                        default=str(DEFAULT_OUTPUT_DIR / "al_curve.png"))
+    parser.add_argument("--save_curve_csv", type=str,
+                        default=str(DEFAULT_OUTPUT_DIR / "al_curve.csv"))
 
     args = parser.parse_args()
 
+    # Apply config file values as defaults (CLI flags override)
+    if args.config is not None:
+        with open(args.config) as f:
+            cfg: Dict[str, Any] = yaml.safe_load(f)
+        cli_set = {a.dest for a in parser._actions if a.option_strings}
+        explicitly_set = {
+            k for k, v in vars(args).items()
+            if k in cli_set and v != parser.get_default(k)
+        }
+        mapping = {
+            # predictor
+            "ensemble_size":        ("predictor", "ensemble_size"),
+            "model_dim":            ("predictor", "model_dim"),
+            "num_heads":            ("predictor", "num_heads"),
+            "num_layers":           ("predictor", "num_layers"),
+            "ff_dim":               ("predictor", "ff_dim"),
+            "dropout":              ("predictor", "dropout"),
+            "batch_size":           ("predictor", "batch_size"),
+            "lr":                   ("predictor", "lr"),
+            "weight_decay":         ("predictor", "weight_decay"),
+            "epochs":               ("predictor", "finetune_epochs"),
+            # active learning
+            "initial_labeled_size": ("active_learning", "initial_labeled_size"),
+            "query_size":           ("active_learning", "batch_size"),
+            "rounds":               ("active_learning", "num_rounds"),
+            "ood_val_fraction":     ("active_learning", "ood_val_fraction"),
+            "ood_split_seed":       ("active_learning", "ood_split_seed"),
+            "test_ratio":           ("active_learning", "test_ratio"),
+            "id_val_ratio":         ("active_learning", "id_val_ratio"),
+            # top-level
+            "seed":                 ("seed",),
+            "device":               ("device",),
+        }
+        for arg_key, cfg_path in mapping.items():
+            if arg_key in explicitly_set:
+                continue
+            node = cfg
+            for part in cfg_path[:-1]:
+                node = node.get(part, {})
+            val = node.get(cfg_path[-1]) if isinstance(node, dict) else cfg.get(cfg_path[0])
+            if val is not None:
+                setattr(args, arg_key, val)
+
     default_method_names = {
         "random": "Random",
-        "uncertainty": "Uncertainty",
-        "uncertainty_ensemble": "Uncertainty Ensemble",
+        "uncertainty": "Uncertainty (MC)",
+        "uncertainty_ensemble": "Uncertainty (Ensemble)",
         "diversity": "Diversity",
     }
-    if args.method_name == "Random":
+    if args.method_name is None:
         args.method_name = default_method_names[args.query_strategy]
+
+    import scanpy as sc
+    import scipy.sparse as sp
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     rng = np.random.default_rng(args.seed)
 
     # ------------------------------------------------------------------
-    # Load data
+    # Load data — call _encode_guide_merged once to populate caches
     # ------------------------------------------------------------------
     gene_embeddings = sanitize_gene_embeddings(np.load(args.gene_embeddings))
     cell_embeddings = np.load(args.cell_embeddings).astype(np.float32)
-    expression_matrix = load_expression_from_h5ad(args.h5ad)
 
-    print("gene_embeddings shape:", gene_embeddings.shape)
-    print("cell_embeddings shape:", cell_embeddings.shape)
-    print("expression_matrix shape:", expression_matrix.shape)
+    adata = sc.read_h5ad(args.h5ad)
+    _encode_guide_merged(adata)   # populates PERT_GENE_IDS / MASK caches
 
-    assert expression_matrix.shape[0] == cell_embeddings.shape[0], (
-        f"Number of cells mismatch: expression has {expression_matrix.shape[0]}, "
-        f"cell_embeddings has {cell_embeddings.shape[0]}"
-    )
-    assert expression_matrix.shape[1] == gene_embeddings.shape[0], (
-        f"Number of genes mismatch: expression has {expression_matrix.shape[1]}, "
-        f"gene_embeddings has {gene_embeddings.shape[0]}"
-    )
+    X = adata.X
+    if sp.issparse(X):
+        X = X.toarray()
+    expression_matrix = np.asarray(X, dtype=np.float32)
 
     n_cells = cell_embeddings.shape[0]
     num_guides = get_cached_num_guides()
     pert_gene_ids = get_cached_pert_gene_ids(n_cells)
     pert_gene_mask = get_cached_pert_gene_mask(n_cells)
 
+    print("gene_embeddings shape:", gene_embeddings.shape)
+    print("cell_embeddings shape:", cell_embeddings.shape)
+    print("expression_matrix shape:", expression_matrix.shape)
+
     # ------------------------------------------------------------------
-    # Build ensemble predictor — always full-retrain each round to match
-    # the original random_sample behaviour (new model per round).
+    # Build condition map
+    # ------------------------------------------------------------------
+    cond_names, cond_cell_indices, gene_sets = _build_condition_map(adata)
+    C = len(cond_names)
+    print(f"Total conditions: {C}")
+
+    # ------------------------------------------------------------------
+    # Build predictor
     # ------------------------------------------------------------------
     predictor_config = {
         "predictor": {
@@ -511,155 +550,225 @@ def main():
             "num_layers": args.num_layers,
             "ff_dim": args.ff_dim,
             "dropout": args.dropout,
-            "full_retrain_every": 1,   # reset weights every round
-            "finetune_epochs": args.epochs,
-            "full_retrain_epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "lr": args.lr,
-            "weight_decay": args.weight_decay,
         }
     }
 
     cell_dim = cell_embeddings.shape[1]
     ensemble = EnsemblePredictor(gene_embeddings, cell_dim, num_guides, predictor_config)
-    trainer = PredictorTrainer(
-        ensemble=ensemble,
-        gene_embeddings=gene_embeddings,
-        cell_dim=cell_dim,
-        num_guides=num_guides,
-        config=predictor_config,
-        device=device,
-    )
+    criterion = torch.nn.MSELoss()
+
+    def _train_ensemble(data: Dict) -> None:
+        """One epoch of training over all ensemble members."""
+        dataset = ExpressionDataset(
+            cell_embeddings=data["cell_embeddings"].astype(np.float32),
+            expression_matrix=data["expression_matrix"].astype(np.float32),
+            pert_gene_ids=data["pert_gene_ids"].astype(np.int64),
+            pert_gene_mask=data["pert_gene_mask"].astype(np.float32),
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=True,
+            num_workers=0, pin_memory=torch.cuda.is_available(),
+        )
+        for member in ensemble.members:
+            member = member.to(device)
+            optimizer = torch.optim.AdamW(
+                member.parameters(), lr=args.lr, weight_decay=args.weight_decay
+            )
+            for _ in range(args.epochs):
+                train_one_epoch(member, loader, optimizer, criterion, device)
+
+    def _eval_ensemble(data: Dict) -> float:
+        """Average MSE across ensemble members."""
+        dataset = ExpressionDataset(
+            cell_embeddings=data["cell_embeddings"].astype(np.float32),
+            expression_matrix=data["expression_matrix"].astype(np.float32),
+            pert_gene_ids=data["pert_gene_ids"].astype(np.int64),
+            pert_gene_mask=data["pert_gene_mask"].astype(np.float32),
+        )
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=args.batch_size, shuffle=False,
+            num_workers=0, pin_memory=torch.cuda.is_available(),
+        )
+        total = 0.0
+        for member in ensemble.members:
+            member = member.to(device)
+            total += evaluate(member, loader, criterion, device)
+        return total / max(ensemble.ensemble_size, 1)
 
     # ------------------------------------------------------------------
-    # Fixed dataset splits (mirrors ALEnvironment in al_env.py)
-    #
-    # all cells
-    # ├── test_cells       (test_ratio = 20%)  — permanent holdout
-    # └── trainable_cells  (80%)
-    #     ├── val_cells    (id_val_ratio = 10% of trainable) — fixed val
-    #     └── pool_cells   — available for AL labeling
+    # Cell-level splits (identical to ALEnvironment)
     # ------------------------------------------------------------------
-    all_indices = np.arange(n_cells)
-    trainable_idx, test_idx = train_test_split(
-        all_indices,
+    all_cell_idx = np.arange(n_cells)
+    trainable_cells, test_cells = train_test_split(
+        all_cell_idx,
         test_size=args.test_ratio,
-        random_state=args.seed,
+        random_state=args.ood_split_seed,   # matches ALEnvironment
         shuffle=True,
     )
-    pool_idx, val_idx = train_test_split(
-        trainable_idx,
-        test_size=args.id_val_ratio,
-        random_state=args.seed + 1,
-        shuffle=True,
+    train_cell_set: Set[int] = set(trainable_cells.tolist())
+
+    # OOD-1 condition split
+    ood_val_conds, _ = _build_ood_split(gene_sets, args.ood_val_fraction, args.ood_split_seed)
+    ood_val_cond_set = set(ood_val_conds)
+
+    ood_val_cells = [
+        ci for c in ood_val_conds
+        for ci in cond_cell_indices[c]
+        if ci in train_cell_set
+    ]
+    ood_val_cell_set = set(ood_val_cells)
+
+    remaining_trainable = np.array(
+        [ci for ci in trainable_cells if ci not in ood_val_cell_set],
+        dtype=np.int64,
     )
 
+    if len(remaining_trainable) > 1:
+        pool_cells_arr, id_val_cells = train_test_split(
+            remaining_trainable,
+            test_size=args.id_val_ratio,
+            random_state=args.ood_split_seed + 1,
+            shuffle=True,
+        )
+    else:
+        pool_cells_arr = remaining_trainable
+        id_val_cells = np.array([], dtype=np.int64)
+
+    pool_cell_set: Set[int] = set(pool_cells_arr.tolist())
+
+    # Condition pool: exclude OOD-val conditions; keep only those with pool cells
+    cond_pool = [
+        c for c in range(C)
+        if c not in ood_val_cond_set
+        and any(ci in pool_cell_set for ci in cond_cell_indices[c])
+    ]
+    print(f"Condition pool size: {len(cond_pool)}")
+
+    # Eval data
     val_data = _build_data_dict(
-        cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask, val_idx
-    )
+        cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask, id_val_cells
+    ) if len(id_val_cells) > 0 else None
+
     test_data = _build_data_dict(
-        cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask, test_idx
+        cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask, test_cells
     )
 
-    # ------------------------------------------------------------------
-    # Initial labeled set sampled from pool only (not val, not test)
-    # ------------------------------------------------------------------
-    initial_labeled_size = min(args.initial_labeled_size, len(pool_idx))
-    initial_labeled = rng.choice(pool_idx, size=initial_labeled_size, replace=False)
+    ood_val_data = _build_data_dict(
+        cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask,
+        np.array(ood_val_cells, dtype=np.int64)
+    ) if ood_val_cells else None
 
-    labeled_set = set(initial_labeled.tolist())
-    unlabeled_set = set(pool_idx.tolist()) - labeled_set
+    # ------------------------------------------------------------------
+    # Initial labeled set (condition-level)
+    # ------------------------------------------------------------------
+    shuffled_pool = list(cond_pool)
+    rng.shuffle(shuffled_pool)
+
+    init_n = min(args.initial_labeled_size, len(shuffled_pool))
+    labeled_conds: List[int] = list(shuffled_pool[:init_n])
+    pool_conds: List[int] = list(shuffled_pool[init_n:])
+
+    labeled_cells: Set[int] = set(_query_cells(labeled_conds, cond_cell_indices, pool_cell_set))
 
     results = []
 
+    # ------------------------------------------------------------------
+    # Active learning loop
+    # ------------------------------------------------------------------
     round_pbar = tqdm(
         range(args.rounds),
-        desc="Active learning",
+        desc=f"AL [{args.query_strategy}]",
         unit="round",
         dynamic_ncols=True,
     )
     for round_id in round_pbar:
-        labeled_indices = np.array(sorted(labeled_set), dtype=np.int64)
+        labeled_idx = np.array(sorted(labeled_cells), dtype=np.int64)
 
-        if len(labeled_indices) < 2:
+        if len(labeled_idx) < 2:
             tqdm.write("Not enough labeled samples to continue.")
             break
 
         round_pbar.set_postfix(
-            strategy=args.query_strategy,
+            labeled_conds=len(labeled_conds),
+            pool_conds=len(pool_conds),
             stage="train",
-            labeled=len(labeled_indices),
-            pool=len(unlabeled_set),
             refresh=False,
         )
 
         train_data = _build_data_dict(
-            cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask,
-            labeled_indices,
+            cell_embeddings, expression_matrix, pert_gene_ids, pert_gene_mask, labeled_idx
         )
-        trainer.update(train_data, round_id)
+        _train_ensemble(train_data)
 
         round_pbar.set_postfix(
-            strategy=args.query_strategy,
+            labeled_conds=len(labeled_conds),
+            pool_conds=len(pool_conds),
             stage="eval",
-            labeled=len(labeled_indices),
-            pool=len(unlabeled_set),
             refresh=False,
         )
 
-        val_mse = trainer.evaluate_on(val_data)
-        test_mse = trainer.evaluate_on(test_data)
+        val_mse = _eval_ensemble(val_data) if val_data is not None else 0.0
+        test_mse = _eval_ensemble(test_data)
+        ood_val_mse = _eval_ensemble(ood_val_data) if ood_val_data is not None else 0.0
 
         results.append({
             "round": round_id,
-            "num_labeled": int(len(labeled_indices)),
-            "best_val_mse": float(val_mse),
-            "test_mse": float(test_mse),
+            "num_labeled_cells": int(len(labeled_idx)),
+            "num_labeled_conds": int(len(labeled_conds)),
+            "id_val_mse":  float(val_mse),       # matches rl round_log column name
+            "ood_val_mse": float(ood_val_mse),
+            "test_mse":    float(test_mse),
         })
 
         round_pbar.set_postfix(
-            strategy=args.query_strategy,
-            stage="query",
-            labeled=len(labeled_indices),
-            pool=len(unlabeled_set),
+            labeled_conds=len(labeled_conds),
+            pool_conds=len(pool_conds),
             val_mse=f"{val_mse:.4f}",
+            ood_mse=f"{ood_val_mse:.4f}",
             test_mse=f"{test_mse:.4f}",
             refresh=True,
         )
-
         tqdm.write(
             f"[Round {round_id}] "
-            f"Labeled: {len(labeled_indices)} | "
-            f"Val MSE: {val_mse:.6f} | "
-            f"Test MSE: {test_mse:.6f}"
+            f"Labeled: {len(labeled_conds)} conds / {len(labeled_idx)} cells | "
+            f"Val MSE: {val_mse:.6f} | OOD MSE: {ood_val_mse:.6f} | Test MSE: {test_mse:.6f}"
         )
 
-        if len(unlabeled_set) == 0:
-            tqdm.write("Unlabeled pool is empty. Stop.")
+        if not pool_conds:
+            tqdm.write("Condition pool exhausted. Stop.")
             break
 
-        unlabeled_indices = np.array(sorted(unlabeled_set))
-        # MC dropout / diversity use the first ensemble member; uncertainty_ensemble uses full ensemble.
-        query_model = ensemble.members[0]
-        queried = query_unlabeled_pool(
+        round_pbar.set_postfix(
+            labeled_conds=len(labeled_conds),
+            pool_conds=len(pool_conds),
+            stage="query",
+            refresh=False,
+        )
+
+        chosen_conds = query_condition_pool(
             strategy=args.query_strategy,
-            model=query_model,
-            ensemble=ensemble if args.query_strategy == "uncertainty_ensemble" else None,
-            labeled_indices=labeled_indices,
-            unlabeled_indices=unlabeled_indices,
+            ensemble=ensemble,
+            labeled_conds=labeled_conds,
+            pool_conds=pool_conds,
+            cond_cell_indices=cond_cell_indices,
+            cell_embeddings=cell_embeddings,
+            pert_gene_ids=pert_gene_ids,
+            pert_gene_mask=pert_gene_mask,
             query_size=args.query_size,
             rng=rng,
-            cell_embeddings=cell_embeddings,
-            expression_matrix=expression_matrix,
-            batch_size=max(64, args.batch_size),
-            num_workers=args.num_workers,
             mc_dropout_passes=args.mc_dropout_passes,
             device=device,
         )
-        for idx in queried:
-            labeled_set.add(int(idx))
-            unlabeled_set.remove(int(idx))
 
+        chosen_set = set(chosen_conds)
+        pool_conds = [c for c in pool_conds if c not in chosen_set]
+        labeled_conds.extend(chosen_conds)
+        for ci in _query_cells(chosen_conds, cond_cell_indices, pool_cell_set):
+            labeled_cells.add(ci)
+
+    # ------------------------------------------------------------------
+    # Save results
+    # ------------------------------------------------------------------
     if not results:
         print("No results to plot.")
         return
@@ -670,34 +779,21 @@ def main():
     csv_path = Path(args.save_curve_csv)
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(csv_path, index=False)
+    print(f"Active learning curve csv saved to: {csv_path}")
 
     save_path = Path(args.save_curve)
     save_path.parent.mkdir(parents=True, exist_ok=True)
-    num_labeled = results_df["num_labeled"].tolist()
-    val_mse_list = results_df["best_val_mse"].tolist()
+
+    num_labeled = results_df["num_labeled_cells"].tolist()
+    val_mse_list = results_df["id_val_mse"].tolist()
     test_mse_list = results_df["test_mse"].tolist()
 
     plt.figure(figsize=(7, 5))
-    plt.plot(
-        num_labeled,
-        test_mse_list,
-        marker="o",
-        linewidth=2.2,
-        markersize=6,
-        color="#1f77b4",
-        label=f"{args.method_name} Test MSE",
-    )
-    plt.plot(
-        num_labeled,
-        val_mse_list,
-        marker="s",
-        linewidth=1.5,
-        markersize=5,
-        linestyle="--",
-        color="#9ecae1",
-        label=f"{args.method_name} Val MSE",
-    )
-    plt.xlabel("Number of labeled samples")
+    plt.plot(num_labeled, test_mse_list, marker="o", linewidth=2.2, markersize=6,
+             color="#1f77b4", label=f"{args.method_name} Test MSE")
+    plt.plot(num_labeled, val_mse_list, marker="s", linewidth=1.5, markersize=5,
+             linestyle="--", color="#9ecae1", label=f"{args.method_name} Val MSE")
+    plt.xlabel("Number of labeled cells")
     plt.ylabel("MSE")
     plt.title("Active Learning Performance")
     plt.grid(True, alpha=0.3)
@@ -705,8 +801,6 @@ def main():
     plt.tight_layout()
     plt.savefig(save_path, dpi=200)
     plt.close()
-
-    print(f"Active learning curve csv saved to: {csv_path}")
     print(f"Active learning curve plot saved to: {save_path}")
 
 

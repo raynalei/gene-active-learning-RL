@@ -30,17 +30,62 @@ python predict.py \
   --batch_size 32 \
   --save_path transformer_predictor.pt
 
-# random sampling
-python random_sample.py \
-  --gene_embeddings norman_2019_scratch_geneformer_padded.npy \
-  --cell_embeddings norman_2019_01B-resolution_singlecell_cell_embedding_t4_resolution.npy \
-  --h5ad norman_2019_adata.h5ad  \
-  --initial_labeled_size 100 \
-  --query_size 100 \
-  --rounds 10 \
-  --epochs 10 \
-  --batch_size 32 \
-  --method_name Random
-  --save_curve random_al_curve.png
-  --save_curve_csv random_al_curve.csv
+
+# baseline (random / uncertainty / diversity)
+
+ python baseline.py \
+   --gene_embeddings norman_2019_scratch_geneformer_padded.npy \
+   --cell_embeddings norman_2019_01B-resolution_singlecell_cell_embedding_t4_resolution.npy \
+   --h5ad norman_2019_adata.h5ad \
+   --query_strategy random \
+   --initial_labeled_size 4 \
+   --query_size 1 \
+   --rounds 20 \
+   --save_curve baselines/al_curve.png \
+   --save_curve_csv baselines/al_curve.csv
+
+ --query_strategy choices: random | uncertainty | uncertainty_ensemble | diversity
+
+ optional: --config configs/fast.yaml  (CLI flags override config values)
+
+# RL (PPO, three-stage pipeline)
+# Stage 1: teacher rollout  →  Stage 2: BC warm-start  →  Stage 3: PPO + Dyna
+
+ python main.py \
+   --gene_embeddings norman_2019_scratch_geneformer_padded.npy \
+   --cell_embeddings norman_2019_01B-resolution_singlecell_cell_embedding_t4_resolution.npy \
+   --h5ad norman_2019_adata.h5ad \
+   --config configs/fast.yaml \
+   --output_dir results/rl/seed42 \
+   --device cuda \
+   --seed 42
+
+ # skip BC warm-start, load existing BC checkpoint instead
+ python main.py ... --bc_checkpoint results/rl/seed42/policy_bc.pt
+
+ # resume PPO from a saved checkpoint
+ python main.py ... --resume results/rl/seed42/ckpt_iter050.pt
+
+ # override individual config fields at runtime
+ python main.py ... --override reward.w_cov=0 ppo.gamma=0.99
+
+ # multi-seed run + result aggregation
+ GENE=norman_2019_scratch_geneformer_padded.npy \
+ CELL=norman_2019_01B-resolution_singlecell_cell_embedding_t4_resolution.npy \
+ H5AD=norman_2019_adata.h5ad \
+ SEEDS="42 0 1 2 3" bash scripts/run_seeds.sh
+
+# evaluate RL policy
+
+ python evaluate.py \
+   --checkpoint results/rl/seed42/policy_final.pt \
+   --gene_embeddings norman_2019_scratch_geneformer_padded.npy \
+   --cell_embeddings norman_2019_01B-resolution_singlecell_cell_embedding_t4_resolution.npy \
+   --h5ad norman_2019_adata.h5ad \
+   --config configs/fast.yaml \
+   --output_dir eval_results \
+   --n_seeds 3
+
+ # stochastic action sampling instead of greedy (default is greedy)
+ python evaluate.py ... --stochastic
 
